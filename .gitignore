@@ -7,3 +7,5 @@
 
 *.duckdb
 *.yaml
+
+*tmp*

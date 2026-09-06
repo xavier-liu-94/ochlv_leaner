@@ -3,15 +3,15 @@ import pandas as pd
 from datetime import datetime
 import logging
 import time
-from config import tushare_token
+from .config import tushare_token
 import duckdb
 from tqdm import tqdm
+import polars as pl
 
 logger = logging.getLogger(__name__)
 
 ts.set_token(tushare_token)
 pro = ts.pro_api()
-conn = duckdb.connect("daily_data/tushare_data.duckdb")
 
 
 def get_stock_daily_data(stock_code: str, start_date: str = None, end_date: str = None, 
@@ -150,6 +150,8 @@ def _insert_overwrite(start_date="20060101", end_date="20260830"):
     幂等：重复运行只会更新/补齐区间内的数据。
     """
 
+    conn = duckdb.connect("daily_data/tushare_data.duckdb")
+
     df_stocks = get_all_stocks_ever_listed()
     total = len(df_stocks)
     logger.info(f"开始更新 {total} 只股票日线数据 ({start_date} ~ {end_date})")
@@ -174,7 +176,6 @@ def _insert_overwrite(start_date="20060101", end_date="20260830"):
             continue
 
         df['ts_code'] = ts_code
-        df['trade_date'] = pd.to_datetime(df['trade_date'], format='%Y%m%d')
         df = df.reindex(columns=cols)
 
         conn.register('_tmp_daily', df)
@@ -186,13 +187,15 @@ def _insert_overwrite(start_date="20060101", end_date="20260830"):
             time.sleep(1.0)
 
     logger.info("全部更新完成")
+    conn.close()
 
 
 def _init_db():
+    conn = duckdb.connect("daily_data/tushare_data.duckdb")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS daily (
-            ts_code       VARCHAR NOT NULL,
-            trade_date    DATE    NOT NULL,
+            ts_code       VARCHAR   NOT NULL,
+            trade_date    VARCHAR   NOT NULL,
             open          DOUBLE,
             high          DOUBLE,
             low           DOUBLE,
@@ -205,6 +208,56 @@ def _init_db():
         )
     """)
     logger.info("init DONE")
+    conn.close()
+
+
+def _ensure_list_date_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stock_list_date (
+            ts_code   VARCHAR NOT NULL,
+            list_date VARCHAR,
+            PRIMARY KEY (ts_code)
+        )
+    """)
+
+
+def get_list_df():
+    """
+    查询股票上市日期，优先读本地缓存，未命中则调用 tushare 接口并写入缓存。
+
+    返回:
+        str: 上市日期 (YYYYMMDD)，未找到时返回空字符串。
+    """
+    conn = duckdb.connect("daily_data/stock_list_data.duckdb")
+    try:
+        df = pl.read_database("SELECT * FROM stock_list_date", connection=conn)
+    finally:
+        conn.close()
+    return df
+
+
+def _update_list_date():
+    """批量刷新全部股票的上市日期缓存，幂等覆盖写入。"""
+    df_stocks = get_all_stocks_ever_listed()
+    df = df_stocks[['ts_code', 'list_date']].dropna(subset=['list_date'])
+
+    conn = duckdb.connect("daily_data/stock_list_data.duckdb")
+    try:
+        _ensure_list_date_table(conn)
+        conn.register('_tmp_list_date', df)
+        conn.execute("INSERT OR REPLACE INTO stock_list_date SELECT * FROM _tmp_list_date")
+        conn.unregister('_tmp_list_date')
+        logger.info(f"上市日期缓存更新完成，共 {len(df)} 只股票")
+    finally:
+        conn.close()
+
+
+def get_db_file():
+    return "daily_data/tushare_data.duckdb"
+
+
+def get_table_name():
+    return "daily"
 
 
 if __name__ == "__main__":
@@ -216,3 +269,4 @@ if __name__ == "__main__":
     
     # _init_db()
     # _insert_overwrite()
+    # _update_list_date()
