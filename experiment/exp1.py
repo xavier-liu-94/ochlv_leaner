@@ -4,7 +4,7 @@ import polars as pl
 import numpy as np
 from datetime import datetime, timedelta
 from daily_data.tushare_engine import get_db_file, get_table_name, get_list_df
-from .exp1_func import calc_strategy_returns, compute_all_kline_indicators
+from .exp1_func import calc_strategy_returns, compute_all_kline_indicators, feature_columns_str, label_column
 import duckdb
 import os
 from tqdm import tqdm
@@ -23,27 +23,79 @@ class BinaryTargetsSet(Dataset):
         self.start_dt = start_dt
         self.end_dt = end_dt
         self.hash_id = hash(start_dt) + hash(end_dt) + hash(str(seq_len))
+        self.conn = duckdb.connect()
         self._prepare_fetcher()
     
     def __getitem__(self, index):
         # return shape seq_feature_tensor: [1, seq_len, feature_nums], mask: [1, seq_len]
-        part = self.datas.iloc[index:index+self.seq_len,:]
-        dis_idx = []
-        dis_mask = []
-        con_value = []
-        con_idx = []
-        con_mask = []
-        for i in range(self.seq_len):
-            x = preprcess_futqdmnc(part.iloc[i,:].to_dict())
-            dis_idx.append(x['discrete_index'])
-            dis_mask.append(x['discrete_mask'])
-            con_value.append(x['continue_value'])
-            con_idx.append(x['continue_index'])
-            con_mask.append(x['continue_mask'])
-        return seq_feature_tensor, mask
+        trade_date, ts_code = self.index_df.iloc[index, :].to_list()
 
+        sql = f"""
+        WITH date_series AS (
+            SELECT 
+                STRFTIME(STRPTIME('{trade_date}', '%Y%m%d')::DATE - CAST((idx) AS INTEGER), '%Y%m%d') AS trade_date,
+                idx
+            FROM generate_series(1, {self.seq_len}) AS t(idx)
+        ),
+        raw_data AS (
+            SELECT *
+            FROM read_parquet('tmp_binary_targets_set/*.parquet')
+            WHERE ts_code = '{ts_code}'
+            AND trade_date >= (SELECT MIN(trade_date) FROM date_series)
+            AND trade_date < '{trade_date}'
+        ),
+        base_close AS (
+            SELECT close AS base_close 
+            FROM raw_data 
+            WHERE close IS NOT NULL 
+            ORDER BY trade_date DESC 
+            LIMIT 1
+        )
+        SELECT 
+            COALESCE(r.open / b.base_close, 0.0) AS open_rel,
+            COALESCE(r.high / b.base_close, 0.0) AS high_rel,
+            COALESCE(r.low / b.base_close, 0.0) AS low_rel,
+            COALESCE(r.close / b.base_close, 0.0) AS close_rel,
+            CASE WHEN r.close IS NOT NULL THEN 1.0 ELSE 0.0 END AS mask,
+            *
+        FROM date_series d
+        LEFT JOIN raw_data r ON d.trade_date = r.trade_date
+        CROSS JOIN base_close b
+        ORDER BY d.idx;
+        """
+        
+        arrow_table = self.conn.execute(sql).fetch_arrow_table()
+
+        feature_cols = feature_columns_str + ['open_rel', 'high_rel', 'low_rel', 'close_rel']
+
+        data_np = np.column_stack([arrow_table[col].to_numpy() for col in feature_cols])
+        mask_np = arrow_table['mask'].to_numpy()
+        label_np = self.conn.execute(f"select income from read_parquet('tmp_binary_targets_set/*.parquet') where ts_code = '{ts_code}' and trade_date = '{trade_date}'").fetch_arrow_table()['income'].to_numpy()
+
+        data_tensor = torch.from_numpy(data_np.astype(np.float32))
+        mask_tensor = torch.from_numpy(mask_np.astype(np.float32))
+        label_tensor = torch.from_numpy(label_np.astype(np.float32))
+
+        return data_tensor, mask_tensor, label_tensor, ts_code, trade_date
+  
     def __len__(self):
-        return len(self.fetch_index)
+        return len(self.index_df)
+
+    def _prepare_fetcher(self):
+        try:
+            conn = duckdb.connect()
+            self.index_df = conn.execute(f"""
+            select trade_date, ts_code
+            from 
+                (
+                    select trade_date, ts_code, min(trade_date) over(partition by ts_code) as min_dt 
+                    from read_parquet('tmp_binary_targets_set/*.parquet')
+                ) 
+            where date_diff('day', strptime(min_dt, '%Y%m%d')::DATE, strptime(trade_date, '%Y%m%d')::DATE) >= {self.seq_len+1}
+            and trade_date >= '{self.start_dt}' and trade_date < '{self.end_dt}'
+            """).df()
+        finally:
+            conn.close()
 
     @staticmethod
     def prepare_full_data():
