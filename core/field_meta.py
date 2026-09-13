@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import torch
+import json
 
 
 class DiscreteCollector():
@@ -319,3 +320,40 @@ def get_meta_process_info_from_dataframe(dataframe):
         if top_count>0.9*nsamples:
             pi.data_column_default_value[column] = top_value
     return FieldMeta(discrete_columns, continuous_columns, pi, dataframe), pi
+
+
+def save(path, fm: FieldMeta, pi: ProcessInfo):
+    json_dict = {
+        "field_meta": {
+            "discrete_fields": fm.discrete_fields,
+            "field_dict": fm.discrete_collector.field_dict,
+            "embedding_num": fm.discrete_collector.embedding_num,
+            "continuous_field_order": fm.continuous_field_order,
+            "continuous_fields": fm.continuous_fields,
+            "continuous_mean_std": fm.continuous_mean_std
+        },
+        "process_info": {
+            "data_column_agg": pi.data_column_agg,
+            "data_column_default_value": pi.data_column_default_value,
+            "data_column_field_name_mapping": pi.data_column_field_name_mapping
+        }
+    }
+    with open(path, 'w') as w:
+        json.dump(json_dict, w)
+
+
+def load(path):
+    with open(path, 'r') as r:
+        json_dict = json.load(r)
+    pi = ProcessInfo()
+    pi.data_column_agg = json_dict['process_info']['data_column_agg']
+    pi.data_column_default_value = json_dict['process_info']['data_column_default_value']
+    pi.data_column_field_name_mapping = json_dict['process_info']['data_column_field_name_mapping']
+    fm = FieldMeta()
+    fm.continuous_field_order = json_dict['field_meta']['continuous_field_order']
+    fm.discrete_fields = json_dict['field_meta']['discrete_fields']
+    fm.continuous_fields = json_dict['field_meta']['continuous_fields']
+    fm.continuous_mean_std = json_dict['field_meta']['continuous_mean_std']
+    fm.discrete_collector.embedding_num = json_dict['field_meta']['embedding_num']
+    fm.discrete_collector.field_dict = json_dict['field_meta']['field_dict']
+    return fm, pi

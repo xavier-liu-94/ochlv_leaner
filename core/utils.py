@@ -8,11 +8,6 @@ import os
 
 
 class TorchTrainingVisualizer:
-    """
-    🎯 每次调用 log_metrics() 必须打一个点！不平均、不跳过、不降采样！
-    专为调试训练动态设计：梯度爆炸、学习率震荡、loss突跳、过拟合苗头...
-    100% 原始数据记录，TensorBoard 显示真实训练心跳。
-    """
 
     def __init__(self,
                  log_dir: str = "./runs",
@@ -28,24 +23,15 @@ class TorchTrainingVisualizer:
         self.step_count = 0  # 全局步数计数器（可选，用于自动递增）
 
     def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None):
-        """
-        ✅ 每次调用，必须打一个点！
-        :param metrics: 字典，如 {'loss': 0.5, 'grad_norm': 2.1, 'lr': 0.001}
-        :param step: 可选。如果你传了，就用你传的（如 batch_idx）。
-                     如果没传，自动用 self.step_count 递增（推荐用于简单场景）
-        """
         if step is None:
             step = self.step_count
             self.step_count += 1  # 自动递增，确保每个调用对应唯一 step
 
         for key, value in metrics.items():
-            # ✅ 强制转换为 float，避免 int/np.float32 导致错误
             if not isinstance(value, float):
                 value = float(value)
             self.writer.add_scalar(key, value, step)
 
-        # 可选：打印调试信息（生产环境可删）
-        # print(f"📊 Step {step}: {metrics}")
 
     def log_gradients(self, model: torch.nn.Module, step: Optional[int] = None):
         """
@@ -66,5 +52,5 @@ class TorchTrainingVisualizer:
 
     def close(self):
         self.writer.close()
-        print(f"✅ TensorBoard 日志已保存至: {self.log_dir}")
-        print("💡 在终端运行: tensorboard --logdir=./runs  查看实时曲线")
+        print(f"TensorBoard 日志已保存至: {self.log_dir}")
+        print("在终端运行: tensorboard --logdir=./runs  查看实时曲线")

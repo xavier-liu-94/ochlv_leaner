@@ -12,12 +12,16 @@ from tqdm import tqdm
 
 exp_config = {
     "unique_name": "exp1_instance1",
-    "seq_len_days": 120
+    "seq_len_days": 120,
+    "train_start": '20070101',
+    "train_end": "20250101",
+    "test_start": '20250101',
+    "test_end": "20260801"
 }
 
 class BinaryTargetsSet(Dataset):
 
-    def __init__(self, seq_len, start_dt=None, end_dt=None) -> None:
+    def __init__(self, seq_len, start_dt=None, end_dt=None, preprocess_func=None) -> None:
         super().__init__()
         self.seq_len = seq_len
         self.start_dt = start_dt
@@ -25,6 +29,7 @@ class BinaryTargetsSet(Dataset):
         self.hash_id = hash(start_dt) + hash(end_dt) + hash(str(seq_len))
         self.conn = duckdb.connect()
         self._prepare_fetcher()
+        self.preprocess_func = preprocess_func
     
     def __getitem__(self, index):
         # return shape seq_feature_tensor: [1, seq_len, feature_nums], mask: [1, seq_len]
@@ -64,18 +69,28 @@ class BinaryTargetsSet(Dataset):
         ORDER BY d.idx;
         """
         
-        arrow_table = self.conn.execute(sql).fetch_arrow_table()
+        pl_df = self.conn.execute(sql).pl()
 
-        feature_cols = feature_columns_str + ['open_rel', 'high_rel', 'low_rel', 'close_rel']
+        if self.preprocess_func is None:
+            return pl_df, ts_code, trade_date
+        
+        else:
+            return self.preprocess_func(pl_df), ts_code, trade_date
 
-        data_np = np.column_stack([arrow_table[col].to_numpy() for col in feature_cols])
-        mask_np = arrow_table['mask'].to_numpy()
-        label_np = self.conn.execute(f"select income from read_parquet('tmp_binary_targets_set/*.parquet') where ts_code = '{ts_code}' and trade_date = '{trade_date}'").fetch_arrow_table()['income'].to_numpy()
+        # feature_cols = feature_columns_str + ['open_rel', 'high_rel', 'low_rel', 'close_rel']
 
-        data_tensor = torch.from_numpy(data_np.astype(np.float32))
-        mask_tensor = torch.from_numpy(mask_np.astype(np.float32))
-        label_tensor = torch.from_numpy(label_np.astype(np.float32))
+        # data_np = np.column_stack([arrow_table[col].to_numpy() for col in feature_cols])
+        # mask_np = arrow_table['mask'].to_numpy()
+        # label_np = self.conn.execute(f"select income from read_parquet('tmp_binary_targets_set/*.parquet') where ts_code = '{ts_code}' and trade_date = '{trade_date}'").fetch_arrow_table()['income'].to_numpy()
 
+        # data_tensor = torch.from_numpy(data_np.astype(np.float32))
+        # mask_tensor = torch.from_numpy(mask_np.astype(np.float32))
+        # label_tensor = torch.from_numpy(label_np.astype(np.float32))
+
+
+
+        return data_tensor, mask_tensor, label_tensor, ts_code, trade_date
+        
         return data_tensor, mask_tensor, label_tensor, ts_code, trade_date
   
     def __len__(self):
@@ -159,7 +174,28 @@ class BinaryTargetsSet(Dataset):
 
 
 def preprocess(exp_config):
-    pass
+    from core.field_meta import get_preprocess_function, get_meta_process_info_from_dataframe, save
+    import polars as pl
+
+    ds = BinaryTargetsSet(exp_config['seq_len_days'], exp_config['train_start'], exp_config['train_end'])
+
+    def collate_fn_tuple(batch):
+        combined_pl_df = pl.concat([x[0] for x in batch], how="vertical")
+    
+        return combined_pl_df
+
+    dl = DataLoader(ds, 1, shuffle=True, collate_fn=collate_fn_tuple, num_workers=8)
+    print(len(ds))
+    collected = []
+    for i, batch_data in enumerate(dl):
+        collected.append(batch_data)
+        print(i)
+        if i > 200:
+            break
+    full_data = pl.concat(collected, how="vertical").to_pandas()
+    fm, pi = get_meta_process_info_from_dataframe(full_data[feature_columns_str + ['open_rel', 'high_rel', 'low_rel', 'close_rel']])
+    os.makedirs(f"run/{exp_config['unique_name']}")
+    save(os.path.join(f"run/{exp_config['unique_name']}/fmpi.json"), fm, pi)
 
 
 def train(exp_config):
