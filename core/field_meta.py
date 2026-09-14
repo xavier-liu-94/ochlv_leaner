@@ -90,14 +90,16 @@ class FieldMeta:
         discrete_fields: list, 
         continuous_fields: list,
         process_info: ProcessInfo,
-        dataframe
+        dataframe,
+        init=True
     ) -> None:
         self.discrete_fields = discrete_fields
         self.continuous_fields = continuous_fields
         self.discrete_collector = DiscreteCollector()
         self.continuous_mean_std = {}
         self.continuous_field_order = []
-        self._init_values(process_info, dataframe)
+        if init:
+            self._init_values(process_info, dataframe)
     
     def _init_values(self, process_info: ProcessInfo, dataframe):
         field_to_column_list = {}
@@ -349,7 +351,7 @@ def load(path):
     pi.data_column_agg = json_dict['process_info']['data_column_agg']
     pi.data_column_default_value = json_dict['process_info']['data_column_default_value']
     pi.data_column_field_name_mapping = json_dict['process_info']['data_column_field_name_mapping']
-    fm = FieldMeta()
+    fm = FieldMeta(None, None, None, None, False)
     fm.continuous_field_order = json_dict['field_meta']['continuous_field_order']
     fm.discrete_fields = json_dict['field_meta']['discrete_fields']
     fm.continuous_fields = json_dict['field_meta']['continuous_fields']

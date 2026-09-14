@@ -8,6 +8,9 @@ from .exp1_func import calc_strategy_returns, compute_all_kline_indicators, feat
 import duckdb
 import os
 from tqdm import tqdm
+from core.model import TransformerModel, DCN
+from core.field_meta import get_preprocess_function, get_embedding_module
+from core.utils import TorchTrainingVisualizer
 
 
 exp_config = {
@@ -16,8 +19,51 @@ exp_config = {
     "train_start": '20070101',
     "train_end": "20250101",
     "test_start": '20250101',
-    "test_end": "20260801"
+    "test_end": "20260801",
+    "embedding_size": 2,
 }
+
+
+class SeqModel(torch.nn.Module):
+    def __init__(self, config_dict, fm, pi) -> None:
+        super().__init__()
+        self.emb = get_embedding_module(fm, pi, config_dict['embedding_size'], 16)
+        self.concat_input_dim = config_dict['embedding_size'] * len(pi.data_column_agg)
+        self.dcn = DCN(self.concat_input_dim)
+        self.dcn_out_dim = 64
+        self.tf = TransformerModel(self.dcn_out_dim, 4, 4, 256)
+        self.seq_len = config_dict['seq_len_days']
+
+        self.fc = torch.nn.Linear(self.dcn_out_dim, 1)
+    
+    def forward(
+        self, 
+        discrete_index,
+        discrete_mask,  
+        continue_value, 
+        continue_index,
+        continue_mask,
+        seq_mask
+    ):
+        bs = discrete_index.size()[0]
+        hidden, mask = self.emb(
+            discrete_index.view([bs*self.seq_len, -1]), 
+            discrete_mask.view([bs*self.seq_len, -1]), 
+            continue_value.view([bs*self.seq_len, -1]), 
+            continue_index.view([bs*self.seq_len, -1]), 
+            continue_mask.view([bs*self.seq_len, -1])
+        )
+        # [batch*seq_len, feature_num, embedding_size] -> [batch*seq_len, feature_num*embedding_size]
+        input_hidden = (hidden * mask.unsqueeze(-1)).view([bs*self.seq_len, self.concat_input_dim])
+        hidden = self.dcn(input_hidden)
+
+        # [batch*seq_len, dcn_out_dim] -> [batch, seq_len, dcn_out_dim]
+        seq_hidden = hidden.view([bs, self.seq_len, self.dcn_out_dim])
+
+        final_out = self.tf(seq_hidden, seq_mask)
+
+        return self.fc(final_out[:, 0, :])
+
 
 class BinaryTargetsSet(Dataset):
 
@@ -27,9 +73,16 @@ class BinaryTargetsSet(Dataset):
         self.start_dt = start_dt
         self.end_dt = end_dt
         self.hash_id = hash(start_dt) + hash(end_dt) + hash(str(seq_len))
-        self.conn = duckdb.connect()
+        self._conn = None
         self._prepare_fetcher()
         self.preprocess_func = preprocess_func
+
+    @property
+    def conn(self):
+        """每个 worker 进程创建自己的连接"""
+        if self._conn is None:
+            self._conn = duckdb.connect()
+        return self._conn
     
     def __getitem__(self, index):
         # return shape seq_feature_tensor: [1, seq_len, feature_nums], mask: [1, seq_len]
@@ -75,24 +128,9 @@ class BinaryTargetsSet(Dataset):
             return pl_df, ts_code, trade_date
         
         else:
-            return self.preprocess_func(pl_df), ts_code, trade_date
+            income = self.conn.execute(f"select income from read_parquet('tmp_binary_targets_set/*.parquet') where ts_code = '{ts_code}' and trade_date = '{trade_date}'").fetchone()[0]
+            return self.preprocess_func(pl_df, ts_code, trade_date, income)
 
-        # feature_cols = feature_columns_str + ['open_rel', 'high_rel', 'low_rel', 'close_rel']
-
-        # data_np = np.column_stack([arrow_table[col].to_numpy() for col in feature_cols])
-        # mask_np = arrow_table['mask'].to_numpy()
-        # label_np = self.conn.execute(f"select income from read_parquet('tmp_binary_targets_set/*.parquet') where ts_code = '{ts_code}' and trade_date = '{trade_date}'").fetch_arrow_table()['income'].to_numpy()
-
-        # data_tensor = torch.from_numpy(data_np.astype(np.float32))
-        # mask_tensor = torch.from_numpy(mask_np.astype(np.float32))
-        # label_tensor = torch.from_numpy(label_np.astype(np.float32))
-
-
-
-        return data_tensor, mask_tensor, label_tensor, ts_code, trade_date
-        
-        return data_tensor, mask_tensor, label_tensor, ts_code, trade_date
-  
     def __len__(self):
         return len(self.index_df)
 
@@ -199,7 +237,44 @@ def preprocess(exp_config):
 
 
 def train(exp_config):
-    pass
+    from core.field_meta import load, get_preprocess_function
+    fm, pi = load(f"run/{exp_config['unique_name']}/fmpi.json")
+
+    process_func = get_preprocess_function(fm, pi)
+
+    def func(pl_df: pl.DataFrame, ts_code, trade_date, income):
+        dis_idx = []
+        dis_mask = []
+        con_value = []
+        con_idx = []
+        con_mask = []
+        for one_data in pl_df.to_dicts():
+            x = process_func(one_data)
+            dis_idx.append(x['discrete_index'])
+            dis_mask.append(x['discrete_mask'])
+            con_value.append(x['continue_value'])
+            con_idx.append(x['continue_index'])
+            con_mask.append(x['continue_mask'])
+        return torch.stack(dis_idx), torch.stack(dis_mask),torch.stack(con_value),torch.stack(con_idx),torch.stack(con_mask), torch.from_numpy(pl_df["mask"].to_numpy(allow_copy=True).astype(np.int64)), 1 if income >=0.033 else 0
+
+    ds = BinaryTargetsSet(exp_config['seq_len_days'], exp_config['train_start'], exp_config['train_end'], func)
+    dl = DataLoader(ds, batch_size=2, shuffle=True, num_workers=0)
+
+    seq_model = SeqModel(exp_config, fm, pi)
+    seq_model.cuda()
+    loss_m = torch.nn.BCELoss()
+    loss_m.cuda()
+    opti = torch.optim.AdamW(seq_model.parameters())
+    tv = TorchTrainingVisualizer(os.path.join(f"run/{exp_config['unique_name']}/tf_log"))
+
+    for one_data in tqdm(dl):
+        opti.zero_grad()
+        out = seq_model(one_data[0].cuda(), one_data[1].cuda(), one_data[2].cuda(), one_data[3].cuda(), one_data[4].cuda(), one_data[5].cuda())
+        loss = loss_m(torch.sigmoid(out.squeeze(1)), one_data[6].float().cuda())
+        tv.log_metrics({"loss": loss.detach().cpu().numpy()})
+        loss.backward()
+        opti.step()
+    torch.save(seq_model.state_dict(), os.path.join(f"run/{exp_config['unique_name']}/model.pth"))
 
 
 def valid(exp_config):

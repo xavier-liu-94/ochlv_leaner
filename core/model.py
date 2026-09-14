@@ -147,7 +147,7 @@ class DCN(nn.Module):
         hidden_dims=(128, 128, 64),
         num_cross_layers: int = 3,
         low_rank: int = 32,
-        output_dim: int = 32,
+        output_dim: int = 64,
         dropout: float = 0.1,
     ):
         super().__init__()
