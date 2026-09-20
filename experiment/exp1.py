@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data.dataloader import Dataset, DataLoader
+from torch.utils.data.dataloader import IterableDataset, DataLoader
 import polars as pl
 import numpy as np
 from datetime import datetime, timedelta
@@ -11,6 +11,7 @@ from tqdm import tqdm
 from core.model import TransformerModel, DCN
 from core.field_meta import get_preprocess_function, get_embedding_module
 from core.utils import TorchTrainingVisualizer
+import random
 
 
 exp_config = {
@@ -65,7 +66,7 @@ class SeqModel(torch.nn.Module):
         return self.fc(final_out[:, 0, :])
 
 
-class BinaryTargetsSet(Dataset):
+class BinaryTargetsSet(IterableDataset):
 
     def __init__(self, seq_len, start_dt=None, end_dt=None, preprocess_func=None) -> None:
         super().__init__()
@@ -74,62 +75,51 @@ class BinaryTargetsSet(Dataset):
         self.end_dt = end_dt
         self.hash_id = hash(start_dt) + hash(end_dt) + hash(str(seq_len))
         self._conn = None
-        self._prepare_fetcher()
         self.preprocess_func = preprocess_func
-
-    @property
-    def conn(self):
-        """每个 worker 进程创建自己的连接"""
-        if self._conn is None:
-            self._conn = duckdb.connect()
-        return self._conn
+        self.conn = duckdb.connect()
+        self._prepare_fetcher()
     
-    def __getitem__(self, index):
-        # return shape seq_feature_tensor: [1, seq_len, feature_nums], mask: [1, seq_len]
-        trade_date, ts_code = self.index_df.iloc[index, :].to_list()
-
-        sql = f"""
-        WITH date_series AS (
-            SELECT 
-                STRFTIME(STRPTIME('{trade_date}', '%Y%m%d')::DATE - CAST((idx) AS INTEGER), '%Y%m%d') AS trade_date,
-                idx
-            FROM generate_series(1, {self.seq_len}) AS t(idx)
-        ),
-        raw_data AS (
+    def __iter__(self):
+        ts_code_order = self.index_df['ts_code'].unique()
+        random.shuffle(ts_code_order)
+        for ts_code in ts_code_order:
+            pl_full_df = self.conn.execute(f"""
             SELECT *
             FROM read_parquet('tmp_binary_targets_set/*.parquet')
             WHERE ts_code = '{ts_code}'
-            AND trade_date >= (SELECT MIN(trade_date) FROM date_series)
-            AND trade_date < '{trade_date}'
-        ),
-        base_close AS (
-            SELECT close AS base_close 
-            FROM raw_data 
-            WHERE close IS NOT NULL 
-            ORDER BY trade_date DESC 
-            LIMIT 1
-        )
-        SELECT 
-            COALESCE(r.open / b.base_close, 0.0) AS open_rel,
-            COALESCE(r.high / b.base_close, 0.0) AS high_rel,
-            COALESCE(r.low / b.base_close, 0.0) AS low_rel,
-            COALESCE(r.close / b.base_close, 0.0) AS close_rel,
-            CASE WHEN r.close IS NOT NULL THEN 1.0 ELSE 0.0 END AS mask,
-            *
-        FROM date_series d
-        LEFT JOIN raw_data r ON d.trade_date = r.trade_date
-        CROSS JOIN base_close b
-        ORDER BY d.idx;
-        """
+            """).pl()
+            trade_date_list = self.index_df[self.index_df['ts_code']==ts_code]['trade_date'].unique()
+            for trade_date in trade_date_list:
+                start_dt = (datetime.strptime(trade_date, '%Y%m%d') - timedelta(days=self.seq_len)).strftime('%Y%m%d')
         
-        pl_df = self.conn.execute(sql).pl()
+                sub_df = pl_full_df.filter(
+                    (pl.col('trade_date') >= start_dt) & (pl.col('trade_date') < trade_date)
+                )
+                
+                valid_close = sub_df.filter(pl.col('close').is_not_null()).sort('trade_date', descending=True)
+                base_close = valid_close['close'][0] if len(valid_close) > 0 else 1.0 
+                
+                pl_df = sub_df.with_columns([
+                    (pl.col('open') / base_close).alias('open_rel'),
+                    (pl.col('high') / base_close).alias('high_rel'),
+                    (pl.col('low') / base_close).alias('low_rel'),
+                    (pl.col('close') / base_close).alias('close_rel'),
+                    pl.when(pl.col('close').is_not_null()).then(1.0).otherwise(0.0).alias('mask')
+                ]).fill_null(0.0)
 
-        if self.preprocess_func is None:
-            return pl_df, ts_code, trade_date
-        
-        else:
-            income = self.conn.execute(f"select income from read_parquet('tmp_binary_targets_set/*.parquet') where ts_code = '{ts_code}' and trade_date = '{trade_date}'").fetchone()[0]
-            return self.preprocess_func(pl_df, ts_code, trade_date, income)
+                date_series = pl.DataFrame({
+                    'trade_date': [(datetime.strptime(trade_date, '%Y%m%d') - timedelta(days=i)).strftime('%Y%m%d') for i in range(1, self.seq_len + 1)],
+                    'idx': list(range(1, self.seq_len + 1))
+                })
+
+                joined = date_series.join(pl_df, on='trade_date', how='left')
+
+                if self.preprocess_func is None:
+                    yield joined, ts_code, trade_date
+                
+                else:
+                    income = self.conn.execute(f"select income from read_parquet('tmp_binary_targets_set/*.parquet') where ts_code = '{ts_code}' and trade_date = '{trade_date}'").fetchone()[0]
+                    yield self.preprocess_func(joined, ts_code, trade_date, income)
 
     def __len__(self):
         return len(self.index_df)
@@ -258,7 +248,7 @@ def train(exp_config):
         return torch.stack(dis_idx), torch.stack(dis_mask),torch.stack(con_value),torch.stack(con_idx),torch.stack(con_mask), torch.from_numpy(pl_df["mask"].to_numpy(allow_copy=True).astype(np.int64)), 1 if income >=0.033 else 0
 
     ds = BinaryTargetsSet(exp_config['seq_len_days'], exp_config['train_start'], exp_config['train_end'], func)
-    dl = DataLoader(ds, batch_size=2, shuffle=True, num_workers=0)
+    dl = DataLoader(ds, batch_size=2, num_workers=0)
 
     seq_model = SeqModel(exp_config, fm, pi)
     seq_model.cuda()
