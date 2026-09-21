@@ -12,6 +12,8 @@ from core.model import TransformerModel, DCN
 from core.field_meta import get_preprocess_function, get_embedding_module
 from core.utils import TorchTrainingVisualizer
 import random
+from torch.utils.data import get_worker_info
+import multiprocessing as mp
 
 
 exp_config = {
@@ -76,13 +78,28 @@ class BinaryTargetsSet(IterableDataset):
         self.hash_id = hash(start_dt) + hash(end_dt) + hash(str(seq_len))
         self._conn = None
         self.preprocess_func = preprocess_func
-        self.conn = duckdb.connect()
         self._prepare_fetcher()
+        self.stop_event = mp.Event()
     
+    @property
+    def conn(self):
+        if self._conn is None:
+            self._conn = duckdb.connect()
+        return self._conn
+
     def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+
         ts_code_order = self.index_df['ts_code'].unique()
         random.shuffle(ts_code_order)
-        for ts_code in ts_code_order:
+
+        assigned = [ts for i, ts in enumerate(ts_code_order) if i % num_workers == worker_id]
+
+        for ts_code in assigned:
+            if self.stop_event.is_set():
+                    break
             pl_full_df = self.conn.execute(f"""
             SELECT *
             FROM read_parquet('tmp_binary_targets_set/*.parquet')
@@ -90,6 +107,8 @@ class BinaryTargetsSet(IterableDataset):
             """).pl()
             trade_date_list = self.index_df[self.index_df['ts_code']==ts_code]['trade_date'].unique()
             for trade_date in trade_date_list:
+                if self.stop_event.is_set():
+                    break
                 start_dt = (datetime.strptime(trade_date, '%Y%m%d') - timedelta(days=self.seq_len)).strftime('%Y%m%d')
         
                 sub_df = pl_full_df.filter(
@@ -118,11 +137,10 @@ class BinaryTargetsSet(IterableDataset):
                     yield joined, ts_code, trade_date
                 
                 else:
-                    income = self.conn.execute(f"select income from read_parquet('tmp_binary_targets_set/*.parquet') where ts_code = '{ts_code}' and trade_date = '{trade_date}'").fetchone()[0]
+                    income_series = pl_full_df.filter(pl.col('trade_date') == trade_date)['income']
+                    income = income_series[0]
                     yield self.preprocess_func(joined, ts_code, trade_date, income)
-
-    def __len__(self):
-        return len(self.index_df)
+        self.stop_event.set()
 
     def _prepare_fetcher(self):
         try:
@@ -245,10 +263,10 @@ def train(exp_config):
             con_value.append(x['continue_value'])
             con_idx.append(x['continue_index'])
             con_mask.append(x['continue_mask'])
-        return torch.stack(dis_idx), torch.stack(dis_mask),torch.stack(con_value),torch.stack(con_idx),torch.stack(con_mask), torch.from_numpy(pl_df["mask"].to_numpy(allow_copy=True).astype(np.int64)), 1 if income >=0.033 else 0
+        return torch.stack(dis_idx), torch.stack(dis_mask),torch.stack(con_value),torch.stack(con_idx),torch.stack(con_mask), torch.LongTensor(pl_df["mask"].fill_null(0.0).to_numpy(allow_copy=True)), 1 if income >=0.033 else 0
 
     ds = BinaryTargetsSet(exp_config['seq_len_days'], exp_config['train_start'], exp_config['train_end'], func)
-    dl = DataLoader(ds, batch_size=2, num_workers=0)
+    dl = DataLoader(ds, batch_size=6, num_workers=6)
 
     seq_model = SeqModel(exp_config, fm, pi)
     seq_model.cuda()
