@@ -14,6 +14,7 @@ from core.utils import TorchTrainingVisualizer
 import random
 from torch.utils.data import get_worker_info
 import multiprocessing as mp
+import pandas as pd
 
 
 exp_config = {
@@ -146,17 +147,22 @@ class BinaryTargetsSet(IterableDataset):
         try:
             conn = duckdb.connect()
             self.index_df = conn.execute(f"""
-            select trade_date, ts_code
-            from 
-                (
-                    select trade_date, ts_code, min(trade_date) over(partition by ts_code) as min_dt 
-                    from read_parquet('tmp_binary_targets_set/*.parquet')
-                ) 
-            where date_diff('day', strptime(min_dt, '%Y%m%d')::DATE, strptime(trade_date, '%Y%m%d')::DATE) >= {self.seq_len+1}
-            and trade_date >= '{self.start_dt}' and trade_date < '{self.end_dt}'
+                select trade_date, ts_code,income
+                from 
+                    (
+                        select trade_date, ts_code,income, min(trade_date) over(partition by ts_code) as min_dt 
+                        from read_parquet('tmp_binary_targets_set/*.parquet')
+                    ) 
+                where date_diff('day', strptime(min_dt, '%Y%m%d')::DATE, strptime(trade_date, '%Y%m%d')::DATE) >= {self.seq_len+1}
+                and trade_date >= '{self.start_dt}' and trade_date < '{self.end_dt}'
             """).df()
         finally:
             conn.close()
+        mask = self.index_df["income"] >= 0.033
+        self.index_df = pd.concat([
+            self.index_df[mask],                              
+            self.index_df[~mask].sample(frac=0.1)             
+        ], ignore_index=True)
 
     @staticmethod
     def prepare_full_data():
@@ -275,14 +281,16 @@ def train(exp_config):
     opti = torch.optim.AdamW(seq_model.parameters())
     tv = TorchTrainingVisualizer(os.path.join(f"run/{exp_config['unique_name']}/tf_log"))
 
-    for one_data in tqdm(dl):
-        opti.zero_grad()
-        out = seq_model(one_data[0].cuda(), one_data[1].cuda(), one_data[2].cuda(), one_data[3].cuda(), one_data[4].cuda(), one_data[5].cuda())
-        loss = loss_m(torch.sigmoid(out.squeeze(1)), one_data[6].float().cuda())
-        tv.log_metrics({"loss": loss.detach().cpu().numpy()})
-        loss.backward()
-        opti.step()
-    torch.save(seq_model.state_dict(), os.path.join(f"run/{exp_config['unique_name']}/model.pth"))
+    for e in range(10):
+        print(f"epoch {e}")
+        for one_data in tqdm(dl):
+            opti.zero_grad()
+            out = seq_model(one_data[0].cuda(), one_data[1].cuda(), one_data[2].cuda(), one_data[3].cuda(), one_data[4].cuda(), one_data[5].cuda())
+            loss = loss_m(torch.sigmoid(out.squeeze(1)), one_data[6].float().cuda())
+            tv.log_metrics({"loss": loss.detach().cpu().numpy()})
+            loss.backward()
+            opti.step()
+        torch.save(seq_model.state_dict(), os.path.join(f"run/{exp_config['unique_name']}/model.pth"))
 
 
 def valid(exp_config):
