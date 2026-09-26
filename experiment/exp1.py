@@ -9,6 +9,7 @@ import duckdb
 import os
 from tqdm import tqdm
 from core.model import TransformerModel, DCN
+from transformers import get_cosine_schedule_with_warmup
 from core.field_meta import get_preprocess_function, get_embedding_module
 from core.utils import TorchTrainingVisualizer
 import random
@@ -283,15 +284,20 @@ def train(exp_config):
     loss_m = torch.nn.BCEWithLogitsLoss()
     loss_m.cuda()
     opti = torch.optim.AdamW(seq_model.parameters())
-    sched = torch.optim.lr_scheduler.OneCycleLR(opti, max_lr=1e-3, total_steps=50000)
+    sched = get_cosine_schedule_with_warmup(
+        opti,
+        num_warmup_steps=30000,
+        num_training_steps=100*10000
+    )
     tv = TorchTrainingVisualizer(os.path.join(f"run/{exp_config['unique_name']}/tf_log"))
-
-    for e in range(10):
+    
+    for e in range(3):
         print(f"epoch {e}")
         for idx, one_data in tqdm(enumerate(dl)):
+            test_info = None
             if idx % 10000 == 0:
                 test_out_dict = test(seq_model, dl_test, 1000)
-                tv.log_metrics({"auc": test_out_dict['auc']})
+                test_info = test_out_dict
             opti.zero_grad()
             out = seq_model(
                 one_data[0].cuda(), 
@@ -301,8 +307,12 @@ def train(exp_config):
                 one_data[4].cuda(), 
                 one_data[5].cuda())
             loss = loss_m(out.squeeze(1), one_data[6].float().cuda())
-            tv.log_metrics({"loss": loss.detach().cpu().numpy()})
+            if test_info is None:
+                tv.log_metrics({"loss": loss.detach().cpu().numpy(),"lr": sched.get_last_lr()[0]})
+            else:
+                tv.log_metrics({"loss": loss.detach().cpu().numpy(),"lr": sched.get_last_lr()[0], 'auc': test_info['auc']})
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(seq_model.parameters(), max_norm=1.0)
             opti.step()
             sched.step()
         torch.save(seq_model.state_dict(), os.path.join(f"run/{exp_config['unique_name']}/model.pth"))
