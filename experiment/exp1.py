@@ -31,7 +31,7 @@ exp_config = {
 class SeqModel(torch.nn.Module):
     def __init__(self, config_dict, fm, pi) -> None:
         super().__init__()
-        self.emb = get_embedding_module(fm, pi, config_dict['embedding_size'], 16)
+        self.emb = get_embedding_module(fm, pi, config_dict['embedding_size'], 8)
         self.concat_input_dim = config_dict['embedding_size'] * len(pi.data_column_agg)
         self.dcn = DCN(self.concat_input_dim)
         self.dcn_out_dim = 64
@@ -236,17 +236,16 @@ def preprocess(exp_config):
     
         return combined_pl_df
 
-    dl = DataLoader(ds, 1, shuffle=True, collate_fn=collate_fn_tuple, num_workers=8)
-    print(len(ds))
+    dl = DataLoader(ds, 1, collate_fn=collate_fn_tuple, num_workers=8)
+
     collected = []
-    for i, batch_data in enumerate(dl):
+    for i, batch_data in tqdm(enumerate(dl)):
         collected.append(batch_data)
-        print(i)
-        if i > 200:
+        if i > 2000:
             break
     full_data = pl.concat(collected, how="vertical").to_pandas()
     fm, pi = get_meta_process_info_from_dataframe(full_data[feature_columns_str + ['open_rel', 'high_rel', 'low_rel', 'close_rel']])
-    os.makedirs(f"run/{exp_config['unique_name']}")
+    os.makedirs(f"run/{exp_config['unique_name']}", exist_ok=True)
     save(os.path.join(f"run/{exp_config['unique_name']}/fmpi.json"), fm, pi)
 
 
@@ -269,7 +268,7 @@ def train(exp_config):
             con_value.append(x['continue_value'])
             con_idx.append(x['continue_index'])
             con_mask.append(x['continue_mask'])
-        return torch.stack(dis_idx), torch.stack(dis_mask),torch.stack(con_value),torch.stack(con_idx),torch.stack(con_mask), torch.LongTensor(pl_df["mask"].fill_null(0.0).to_numpy(allow_copy=True)), 1 if income >=0.033 else 0
+        return torch.stack(dis_idx), torch.stack(dis_mask),torch.stack(con_value),torch.stack(con_idx),torch.stack(con_mask), torch.LongTensor(pl_df["mask"].fill_null(0.0).to_numpy(allow_copy=True)), 1 if income >=0 else 0
 
     ds = BinaryTargetsSet(exp_config['seq_len_days'], exp_config['train_start'], exp_config['train_end'], func)
     dl = DataLoader(ds, batch_size=6, num_workers=6)
