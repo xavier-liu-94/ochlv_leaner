@@ -15,6 +15,7 @@ import random
 from torch.utils.data import get_worker_info
 import multiprocessing as mp
 import pandas as pd
+from sklearn.metrics import roc_auc_score
 
 
 exp_config = {
@@ -24,7 +25,7 @@ exp_config = {
     "train_end": "20250101",
     "test_start": '20250101',
     "test_end": "20260801",
-    "embedding_size": 2,
+    "embedding_size": 4,
 }
 
 
@@ -33,9 +34,9 @@ class SeqModel(torch.nn.Module):
         super().__init__()
         self.emb = get_embedding_module(fm, pi, config_dict['embedding_size'], 8)
         self.concat_input_dim = config_dict['embedding_size'] * len(pi.data_column_agg)
-        self.dcn = DCN(self.concat_input_dim)
-        self.dcn_out_dim = 64
-        self.tf = TransformerModel(self.dcn_out_dim, 4, 4, 256)
+        self.dcn_out_dim = 128
+        self.dcn = DCN(self.concat_input_dim, output_dim=self.dcn_out_dim)
+        self.tf = TransformerModel(self.dcn_out_dim, 4, 4, 1024)
         self.seq_len = config_dict['seq_len_days']
 
         self.fc = torch.nn.Linear(self.dcn_out_dim, 1)
@@ -272,6 +273,8 @@ def train(exp_config):
 
     ds = BinaryTargetsSet(exp_config['seq_len_days'], exp_config['train_start'], exp_config['train_end'], func)
     dl = DataLoader(ds, batch_size=6, num_workers=6)
+    ds_test = BinaryTargetsSet(exp_config['seq_len_days'], exp_config['test_start'], exp_config['test_end'], func)
+    dl_test = DataLoader(ds_test, batch_size=2, num_workers=2)
 
     seq_model = SeqModel(exp_config, fm, pi)
     seq_model.cuda()
@@ -282,15 +285,39 @@ def train(exp_config):
 
     for e in range(10):
         print(f"epoch {e}")
-        for one_data in tqdm(dl):
+        for idx, one_data in tqdm(enumerate(dl)):
+            if idx % 10000 == 0:
+                test_out_dict = test(seq_model, dl_test, 1000)
+                tv.log_metrics({"auc": test_out_dict['auc']})
             opti.zero_grad()
-            out = seq_model(one_data[0].cuda(), one_data[1].cuda(), one_data[2].cuda(), one_data[3].cuda(), one_data[4].cuda(), one_data[5].cuda())
+            out = seq_model(
+                one_data[0].cuda(), 
+                one_data[1].cuda(), 
+                one_data[2].cuda(), 
+                one_data[3].cuda(), 
+                one_data[4].cuda(), 
+                one_data[5].cuda())
             loss = loss_m(torch.sigmoid(out.squeeze(1)), one_data[6].float().cuda())
             tv.log_metrics({"loss": loss.detach().cpu().numpy()})
             loss.backward()
             opti.step()
         torch.save(seq_model.state_dict(), os.path.join(f"run/{exp_config['unique_name']}/model.pth"))
 
+
+def test(model, dataloader, max_steps=None):
+    model.eval()
+    full_pred = []
+    full_gt = []
+    with torch.no_grad():
+        for idx, one_data in tqdm(enumerate(dataloader)):
+            out = model(one_data[0].cuda(), one_data[1].cuda(), one_data[2].cuda(), one_data[3].cuda(), one_data[4].cuda(), one_data[5].cuda())
+            full_pred.append(torch.sigmoid(out.squeeze(1)).cpu().numpy())
+            full_gt.append(one_data[6].numpy())
+            if max_steps is not None and idx >= max_steps:
+                break
+    model.train()
+    auc = roc_auc_score(np.concatenate(full_gt), np.concatenate(full_pred))
+    return {'auc': auc}
 
 def valid(exp_config):
     pass

@@ -115,7 +115,7 @@ class MLP(nn.Module):
 
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(last_dim, hidden_dim))
-            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
 
