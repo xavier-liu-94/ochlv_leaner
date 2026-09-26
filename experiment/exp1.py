@@ -66,8 +66,10 @@ class SeqModel(torch.nn.Module):
         seq_hidden = hidden.view([bs, self.seq_len, self.dcn_out_dim])
 
         final_out = self.tf(seq_hidden, seq_mask)
+        m = seq_mask.unsqueeze(-1).float()
+        pooled = (final_out * m).sum(1) / m.sum(1).clamp(min=1.0)
 
-        return self.fc(final_out[:, 0, :])
+        return self.fc(pooled)
 
 
 class BinaryTargetsSet(IterableDataset):
@@ -159,7 +161,7 @@ class BinaryTargetsSet(IterableDataset):
             """).df()
         finally:
             conn.close()
-        mask = self.index_df["income"] >= 0.033
+        mask = self.index_df["income"] >= 0
         self.index_df = pd.concat([
             self.index_df[mask],                              
             self.index_df[~mask].sample(frac=0.1)             
@@ -278,9 +280,10 @@ def train(exp_config):
 
     seq_model = SeqModel(exp_config, fm, pi)
     seq_model.cuda()
-    loss_m = torch.nn.BCELoss()
+    loss_m = torch.nn.BCEWithLogitsLoss()
     loss_m.cuda()
     opti = torch.optim.AdamW(seq_model.parameters())
+    sched = torch.optim.lr_scheduler.OneCycleLR(opti, max_lr=1e-3, total_steps=50000)
     tv = TorchTrainingVisualizer(os.path.join(f"run/{exp_config['unique_name']}/tf_log"))
 
     for e in range(10):
@@ -297,10 +300,11 @@ def train(exp_config):
                 one_data[3].cuda(), 
                 one_data[4].cuda(), 
                 one_data[5].cuda())
-            loss = loss_m(torch.sigmoid(out.squeeze(1)), one_data[6].float().cuda())
+            loss = loss_m(out.squeeze(1), one_data[6].float().cuda())
             tv.log_metrics({"loss": loss.detach().cpu().numpy()})
             loss.backward()
             opti.step()
+            sched.step()
         torch.save(seq_model.state_dict(), os.path.join(f"run/{exp_config['unique_name']}/model.pth"))
 
 
