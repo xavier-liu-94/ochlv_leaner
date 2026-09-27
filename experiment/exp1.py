@@ -10,7 +10,7 @@ import os
 from tqdm import tqdm
 from core.model import TransformerModel, DCN
 from transformers import get_cosine_schedule_with_warmup
-from core.field_meta import get_preprocess_function, get_embedding_module
+from core.field_meta import get_preprocess_function, get_embedding_module, get_batch_preprocess_function
 from core.utils import TorchTrainingVisualizer
 import random
 from torch.utils.data import get_worker_info
@@ -26,7 +26,11 @@ exp_config = {
     "train_end": "20250101",
     "test_start": '20250101',
     "test_end": "20260801",
-    "embedding_size": 4,
+    "embedding_size": 2,
+    "dcn_out_dim": 128,
+    "transformer_layers": 8,
+    "attention_heads": 16,
+    "transformer_hidden": 512
 }
 
 
@@ -35,11 +39,16 @@ class SeqModel(torch.nn.Module):
         super().__init__()
         self.emb = get_embedding_module(fm, pi, config_dict['embedding_size'], 8)
         self.concat_input_dim = config_dict['embedding_size'] * len(pi.data_column_agg)
-        self.dcn_out_dim = 128
+        self.dcn_out_dim = config_dict['dcn_out_dim']
         self.dcn = DCN(self.concat_input_dim, output_dim=self.dcn_out_dim)
         self.seq_len = config_dict['seq_len_days']
         self.register_parameter("clf_token", torch.nn.Parameter(torch.randn([1, self.dcn_out_dim])))
-        self.tf = TransformerModel(self.dcn_out_dim, 4, 4, 1024, self.seq_len+1)
+        self.tf = TransformerModel(
+            self.dcn_out_dim, 
+            config_dict['transformer_layers'], 
+            config_dict['attention_heads'], 
+            config_dict['transformer_hidden'], 
+            self.seq_len+1)
 
         self.fc = torch.nn.Linear(self.dcn_out_dim, 1)
     
@@ -255,30 +264,20 @@ def preprocess(exp_config):
 
 
 def train(exp_config):
-    from core.field_meta import load, get_preprocess_function
+    from core.field_meta import load, get_batch_preprocess_function
     fm, pi = load(f"run/{exp_config['unique_name']}/fmpi.json")
 
-    process_func = get_preprocess_function(fm, pi)
+    process_batch = get_batch_preprocess_function(fm, pi)
 
     def func(pl_df: pl.DataFrame, ts_code, trade_date, income):
-        dis_idx = []
-        dis_mask = []
-        con_value = []
-        con_idx = []
-        con_mask = []
-        for one_data in pl_df.to_dicts():
-            x = process_func(one_data)
-            dis_idx.append(x['discrete_index'])
-            dis_mask.append(x['discrete_mask'])
-            con_value.append(x['continue_value'])
-            con_idx.append(x['continue_index'])
-            con_mask.append(x['continue_mask'])
-        return torch.stack(dis_idx), torch.stack(dis_mask),torch.stack(con_value),torch.stack(con_idx),torch.stack(con_mask), torch.LongTensor(pl_df["mask"].fill_null(0.0).to_numpy().copy()), 1 if income >=0.02 else 0
+        dis_idx, dis_mask, con_val, con_idx, con_mask = process_batch(pl_df)
+        seq_mask = torch.LongTensor(pl_df["mask"].fill_null(0.0).to_numpy().copy())
+        return dis_idx, dis_mask, con_val, con_idx, con_mask, seq_mask, 1 if income >= 0.02 else 0
 
     ds = BinaryTargetsSet(exp_config['seq_len_days'], exp_config['train_start'], exp_config['train_end'], func)
-    dl = DataLoader(ds, batch_size=6, num_workers=6)
+    dl = DataLoader(ds, batch_size=100, num_workers=4)
     ds_test = BinaryTargetsSet(exp_config['seq_len_days'], exp_config['test_start'], exp_config['test_end'], func)
-    dl_test = DataLoader(ds_test, batch_size=2, num_workers=2)
+    dl_test = DataLoader(ds_test, batch_size=100, num_workers=2)
 
     seq_model = SeqModel(exp_config, fm, pi)
     seq_model.cuda()
@@ -287,17 +286,17 @@ def train(exp_config):
     opti = torch.optim.AdamW(seq_model.parameters())
     sched = get_cosine_schedule_with_warmup(
         opti,
-        num_warmup_steps=30000,
-        num_training_steps=100*10000
+        num_warmup_steps=1000,
+        num_training_steps=100000
     )
     tv = TorchTrainingVisualizer(os.path.join(f"run/{exp_config['unique_name']}/tf_log"))
     
-    for e in range(3):
+    for e in range(10):
         print(f"epoch {e}")
         for idx, one_data in tqdm(enumerate(dl)):
             test_info = None
-            if idx % 10000 == 0:
-                test_out_dict = test(seq_model, dl_test, 1000)
+            if idx % 500 == 0:
+                test_out_dict = test(seq_model, dl_test, 20)
                 test_info = test_out_dict
             opti.zero_grad()
             out = seq_model(
@@ -316,7 +315,20 @@ def train(exp_config):
             torch.nn.utils.clip_grad_norm_(seq_model.parameters(), max_norm=1.0)
             opti.step()
             sched.step()
-        torch.save(seq_model.state_dict(), os.path.join(f"run/{exp_config['unique_name']}/model.pth"))
+        torch.save(seq_model.state_dict(), os.path.join(f"run/{exp_config['unique_name']}/model-{e}.pth"))
+
+
+def test_one(model, one_data):
+    model.eval()
+    full_pred = []
+    full_gt = []
+    with torch.no_grad():
+        out = model(one_data[0].cuda(), one_data[1].cuda(), one_data[2].cuda(), one_data[3].cuda(), one_data[4].cuda(), one_data[5].cuda())
+        full_pred.append(torch.sigmoid(out.squeeze(1)).cpu().numpy())
+        full_gt.append(one_data[6].numpy())
+    model.train()
+    auc = roc_auc_score(np.concatenate(full_gt), np.concatenate(full_pred))
+    return {'auc': auc}
 
 
 def test(model, dataloader, max_steps=None):

@@ -199,6 +199,85 @@ def get_preprocess_function(field_meta: FieldMeta, process_info: ProcessInfo) ->
     return preprocess_one_data
 
 
+def get_batch_preprocess_function(field_meta: FieldMeta, process_info: ProcessInfo) -> callable:
+    disc_meta = []   # (column, field_dict, default_value, pad_idx)
+    cont_meta = []   # (column, mean, std, order_idx, default_value, pad_idx)
+    for element in process_info.data_column_agg:
+        columns = element if isinstance(element, list) else [element]
+        for column in columns:
+            field_name = process_info.data_column_field_name_mapping[column]
+            if field_meta.is_discrete(field_name):
+                disc_meta.append((
+                    column,
+                    field_meta.discrete_collector.field_dict.get(field_name, {}),
+                    process_info.data_column_default_value.get(column),
+                    len(field_meta.discrete_collector),
+                ))
+            else:
+                mean, std = field_meta.continuous_mean_std[field_name]
+                cont_meta.append((
+                    column, mean, std,
+                    field_meta.continuous_field_order.index(field_name),
+                    process_info.data_column_default_value.get(column),
+                    len(field_meta.continuous_field_order),
+                ))
+
+    disc_cols = [m[0] for m in disc_meta]
+    disc_fmaps = [{float(k): v for k, v in m[1].items()} for m in disc_meta]
+    disc_default = [m[2] for m in disc_meta]
+    disc_pad = [m[3] for m in disc_meta]
+
+    cont_cols = [m[0] for m in cont_meta]
+    cont_mean = np.array([m[1] for m in cont_meta], dtype=np.float64)
+    cont_std = np.array([m[2] for m in cont_meta], dtype=np.float64)
+    cont_order = np.array([m[3] for m in cont_meta], dtype=np.int64)
+    cont_default = [m[4] for m in cont_meta]
+    cont_pad = cont_meta[0][5] if cont_meta else 0
+
+    def preprocess_batch(pl_df):
+        n = pl_df.height
+
+        if disc_cols:
+            arr = pl_df.select(disc_cols).to_numpy()  # (n, k) float64
+            isnull = np.isnan(arr)
+            for i, default in enumerate(disc_default):
+                if default is not None:
+                    isnull[:, i] = isnull[:, i] | (arr[:, i] == default)
+            idx = np.full((n, len(disc_cols)), 0, dtype=np.int64)
+            for i, fm in enumerate(disc_fmaps):
+                idx[:, i] = disc_pad[i]
+                for fval, fidx in fm.items():
+                    idx[arr[:, i] == fval, i] = fidx
+            disc_idx, disc_mask = idx, (~isnull).astype(np.int64)
+        else:
+            disc_idx = np.empty((n, 0), dtype=np.int64)
+            disc_mask = np.empty((n, 0), dtype=np.int64)
+
+        if cont_cols:
+            arr = pl_df.select(cont_cols).to_numpy()
+            isnull = np.isnan(arr)
+            for i, default in enumerate(cont_default):
+                if default is not None:
+                    isnull[:, i] = isnull[:, i] | (arr[:, i] == default)
+            val = (arr - cont_mean) / cont_std
+            val[isnull] = 0.0
+            cidx = np.where(isnull, cont_pad, cont_order).astype(np.int64)
+            con_val, con_idx, con_mask = val, cidx, (~isnull).astype(np.int64)
+        else:
+            con_val = np.empty((n, 0), dtype=np.float64)
+            con_idx = np.empty((n, 0), dtype=np.int64)
+            con_mask = np.empty((n, 0), dtype=np.int64)
+
+        return (
+            torch.from_numpy(disc_idx).int(),
+            torch.from_numpy(disc_mask).int(),
+            torch.from_numpy(con_val).float(),
+            torch.from_numpy(con_idx).int(),
+            torch.from_numpy(con_mask).int(),
+        )
+
+    return preprocess_batch
+
 class EmbeddingModule(torch.nn.Module):
 
     def __init__(
