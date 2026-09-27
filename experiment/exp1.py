@@ -37,8 +37,9 @@ class SeqModel(torch.nn.Module):
         self.concat_input_dim = config_dict['embedding_size'] * len(pi.data_column_agg)
         self.dcn_out_dim = 128
         self.dcn = DCN(self.concat_input_dim, output_dim=self.dcn_out_dim)
-        self.tf = TransformerModel(self.dcn_out_dim, 4, 4, 1024)
         self.seq_len = config_dict['seq_len_days']
+        self.register_parameter("clf_token", torch.nn.Parameter(torch.randn([1, self.dcn_out_dim])))
+        self.tf = TransformerModel(self.dcn_out_dim, 4, 4, 1024, self.seq_len+1)
 
         self.fc = torch.nn.Linear(self.dcn_out_dim, 1)
     
@@ -64,13 +65,12 @@ class SeqModel(torch.nn.Module):
         hidden = self.dcn(input_hidden)
 
         # [batch*seq_len, dcn_out_dim] -> [batch, seq_len, dcn_out_dim]
-        seq_hidden = hidden.view([bs, self.seq_len, self.dcn_out_dim])
+        seq_hidden = torch.cat([hidden.view([bs, self.seq_len, self.dcn_out_dim]), self.clf_token.repeat(bs, 1, 1)], dim=1)
+        seq_mask = torch.cat([seq_mask, torch.ones([bs, 1], device=seq_mask.device)], dim=1)
 
         final_out = self.tf(seq_hidden, seq_mask)
-        m = seq_mask.unsqueeze(-1).float()
-        pooled = (final_out * m).sum(1) / m.sum(1).clamp(min=1.0)
 
-        return self.fc(pooled)
+        return self.fc(final_out[:,-1,:])
 
 
 class BinaryTargetsSet(IterableDataset):
@@ -101,10 +101,11 @@ class BinaryTargetsSet(IterableDataset):
         random.shuffle(ts_code_order)
 
         assigned = [ts for i, ts in enumerate(ts_code_order) if i % num_workers == worker_id]
+        self.stop_event.clear()
 
         for ts_code in assigned:
             if self.stop_event.is_set():
-                    break
+                break
             pl_full_df = self.conn.execute(f"""
             SELECT *
             FROM read_parquet('tmp_binary_targets_set/*.parquet')
@@ -142,9 +143,9 @@ class BinaryTargetsSet(IterableDataset):
                     yield joined, ts_code, trade_date
                 
                 else:
-                    income_series = pl_full_df.filter(pl.col('trade_date') == trade_date)['income']
-                    income = income_series[0]
-                    yield self.preprocess_func(joined, ts_code, trade_date, income)
+                    high = pl_full_df.filter(pl.col('trade_date') == trade_date)['high'][0]
+                    open = pl_full_df.filter(pl.col('trade_date') == trade_date)['open'][0]
+                    yield self.preprocess_func(joined, ts_code, trade_date, high/open - 1)
         self.stop_event.set()
 
     def _prepare_fetcher(self):
@@ -162,11 +163,11 @@ class BinaryTargetsSet(IterableDataset):
             """).df()
         finally:
             conn.close()
-        mask = self.index_df["income"] >= 0
-        self.index_df = pd.concat([
-            self.index_df[mask],                              
-            self.index_df[~mask].sample(frac=0.1)             
-        ], ignore_index=True)
+        # mask = self.index_df["income"] >= 0
+        # self.index_df = pd.concat([
+        #     self.index_df[mask],                              
+        #     self.index_df[~mask].sample(frac=0.1)             
+        # ], ignore_index=True)
 
     @staticmethod
     def prepare_full_data():
@@ -272,7 +273,7 @@ def train(exp_config):
             con_value.append(x['continue_value'])
             con_idx.append(x['continue_index'])
             con_mask.append(x['continue_mask'])
-        return torch.stack(dis_idx), torch.stack(dis_mask),torch.stack(con_value),torch.stack(con_idx),torch.stack(con_mask), torch.LongTensor(pl_df["mask"].fill_null(0.0).to_numpy(allow_copy=True)), 1 if income >=0 else 0
+        return torch.stack(dis_idx), torch.stack(dis_mask),torch.stack(con_value),torch.stack(con_idx),torch.stack(con_mask), torch.LongTensor(pl_df["mask"].fill_null(0.0).to_numpy().copy()), 1 if income >=0.02 else 0
 
     ds = BinaryTargetsSet(exp_config['seq_len_days'], exp_config['train_start'], exp_config['train_end'], func)
     dl = DataLoader(ds, batch_size=6, num_workers=6)

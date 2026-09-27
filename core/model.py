@@ -5,7 +5,7 @@ import torch.nn as nn
 
 class TransformerModel(torch.nn.Module):
 
-    def __init__(self, hidden_size, num_hidden_layers, num_attention_heads, intermediate_size) -> None:
+    def __init__(self, hidden_size, num_hidden_layers, num_attention_heads, intermediate_size, max_seq_len) -> None:
         super().__init__()
         self.model = RoFormerEncoder(
             RoFormerConfig(
@@ -13,7 +13,8 @@ class TransformerModel(torch.nn.Module):
                 hidden_size=hidden_size,
                 num_hidden_layers=num_hidden_layers,
                 num_attention_heads=num_attention_heads,
-                intermediate_size=intermediate_size
+                intermediate_size=intermediate_size,
+                max_position_embeddings=max_seq_len
             )
         )
     
