@@ -283,10 +283,10 @@ def train(exp_config):
     seq_model.cuda()
     loss_m = torch.nn.BCEWithLogitsLoss()
     loss_m.cuda()
-    opti = torch.optim.AdamW(seq_model.parameters())
+    opti = torch.optim.AdamW(seq_model.parameters(), lr=1e-4)
     sched = get_cosine_schedule_with_warmup(
         opti,
-        num_warmup_steps=1000,
+        num_warmup_steps=10000,
         num_training_steps=100000
     )
     tv = TorchTrainingVisualizer(os.path.join(f"run/{exp_config['unique_name']}/tf_log"))
