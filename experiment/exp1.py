@@ -286,8 +286,8 @@ def train(exp_config):
     opti = torch.optim.AdamW(seq_model.parameters(), lr=1e-4)
     sched = get_cosine_schedule_with_warmup(
         opti,
-        num_warmup_steps=10000,
-        num_training_steps=100000
+        num_warmup_steps=40000,
+        num_training_steps=400000
     )
     tv = TorchTrainingVisualizer(os.path.join(f"run/{exp_config['unique_name']}/tf_log"))
     
@@ -295,8 +295,8 @@ def train(exp_config):
         print(f"epoch {e}")
         for idx, one_data in tqdm(enumerate(dl)):
             test_info = None
-            if idx % 500 == 0:
-                test_out_dict = test(seq_model, dl_test, 20)
+            if idx % 2000 == 0:
+                test_out_dict = test(seq_model, dl_test, 100)
                 test_info = test_out_dict
             opti.zero_grad()
             out = seq_model(
@@ -315,6 +315,8 @@ def train(exp_config):
             torch.nn.utils.clip_grad_norm_(seq_model.parameters(), max_norm=1.0)
             opti.step()
             sched.step()
+            if idx % 10000 == 0:
+                torch.save(seq_model.state_dict(), os.path.join(f"run/{exp_config['unique_name']}/model-{e}.pth"))
         torch.save(seq_model.state_dict(), os.path.join(f"run/{exp_config['unique_name']}/model-{e}.pth"))
 
 
